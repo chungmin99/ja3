@@ -5,7 +5,6 @@ import argparse
 import dpkt
 import json
 import socket
-import binascii
 import struct
 from hashlib import md5
 
@@ -100,38 +99,23 @@ def convert_to_ja3_segment(data, element_width):
     return "-".join(str(x) for x in int_vals)
 
 
-def process_extensions(client_handshake):
+def process_extensions(server_handshake):
     """Process any extra extensions and convert to a JA3 segment.
 
     :param client_handshake: Handshake data from the packet
     :type client_handshake: dpkt.ssl.TLSClientHello
     :returns: list
     """
-    if not hasattr(client_handshake, "extensions"):
+    if not hasattr(server_handshake, "extensions"):
         # Needed to preserve commas on the join
-        return ["", "", ""]
+        return [""]
 
     exts = list()
-    elliptic_curve = ""
-    elliptic_curve_point_format = ""
-    for ext_val, ext_data in client_handshake.extensions:
-        if not GREASE_TABLE.get(ext_val):
-            exts.append(ext_val)
-        if ext_val == 0x0a:
-            a, b = parse_variable_array(ext_data, 2)
-            # Elliptic curve points (16 bit values)
-            elliptic_curve = convert_to_ja3_segment(a, 2)
-        elif ext_val == 0x0b:
-            a, b = parse_variable_array(ext_data, 1)
-            # Elliptic curve point formats (8 bit values)
-            elliptic_curve_point_format = convert_to_ja3_segment(a, 1)
-        else:
-            continue
+    for ext_val, ext_data in server_handshake.extensions:
+        exts.append(ext_val)
 
     results = list()
     results.append("-".join([str(x) for x in exts]))
-    results.append(elliptic_curve)
-    results.append(elliptic_curve_point_format)
     return results
 
 
@@ -187,27 +171,25 @@ def process_pcap(pcap, any_port=False):
                 continue
             if len(record.data) == 0:
                 continue
-            client_hello = bytearray(record.data)
-            if client_hello[0] != 1:
-                # We only want client HELLO
+            server_hello = bytearray(record.data)
+            if server_hello[0] != 2:
+                # We only want server HELLO
                 continue
             try:
                 handshake = dpkt.ssl.TLSHandshake(record.data)
             except dpkt.dpkt.NeedData:
                 # Looking for a handshake here
                 continue
-            if not isinstance(handshake.data, dpkt.ssl.TLSClientHello):
+            if not isinstance(handshake.data, dpkt.ssl.TLSServerHello):
                 # Still not the HELLO
                 continue
 
-            client_handshake = handshake.data
-            buf, ptr = parse_variable_array(client_handshake.data, 1)
-            buf, ptr = parse_variable_array(client_handshake.data[ptr:], 2)
-            ja3 = [str(client_handshake.version)]
+            server_handshake = handshake.data
+            ja3 = [str(server_handshake.version)]
 
             # Cipher Suites (16 bit values)
-            ja3.append(convert_to_ja3_segment(buf, 2))
-            ja3 += process_extensions(client_handshake)
+            ja3.append(str(server_handshake.cipher_suite))
+            ja3 += process_extensions(server_handshake)
             ja3 = ",".join(ja3)
 
             record = {"source_ip": convert_ip(ip.src),
@@ -216,8 +198,7 @@ def process_pcap(pcap, any_port=False):
                       "destination_port": tcp.dport,
                       "ja3": ja3,
                       "ja3_digest": md5(ja3.encode()).hexdigest(),
-                      "timestamp": timestamp,
-                      "client_hello_pkt": binascii.hexlify(tcp.data).decode('utf-8')}
+                      "timestamp": timestamp}
             results.append(record)
 
     return results
@@ -235,9 +216,6 @@ def main():
     help_text = "Print out as JSON records for downstream parsing"
     parser.add_argument("-j", "--json", required=False, action="store_true",
                         default=False, help=help_text)
-    help_text = "Print packet related data for research (json only)"
-    parser.add_argument("-r", "--research", required=False, action="store_true",
-                        default=False, help=help_text)
     args = parser.parse_args()
 
     # Use an iterator to process each line of the file
@@ -250,15 +228,11 @@ def main():
         output = process_pcap(capture, any_port=args.any_port)
 
     if args.json:
-        if not args.research:
-            def remove_items(x):
-                del x['client_hello_pkt']
-            list(map(remove_items,output))
         output = json.dumps(output, indent=4, sort_keys=True)
         print(output)
     else:
         for record in output:
-            tmp = '[{dest}:{port}] JA3: {segment} --> {digest}'
+            tmp = '[{dest}:{port}] JA3S: {segment} --> {digest}'
             tmp = tmp.format(dest=record['destination_ip'],
                              port=record['destination_port'],
                              segment=record['ja3'],
